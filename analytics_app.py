@@ -374,8 +374,8 @@ def _render_interviews(result, pools, tr_sum, academy_kw, intensive_kw, extra_pa
     r1 = st.columns(4)
     for col, key in zip(r1, ["Candidates", "Shortlisted (in SA)", "Applied (in TA)", "Interviewed"]):
         col.metric(key, f"{h[key]:,}")
-    r2 = st.columns(4)
-    for col, key in zip(r2, ["Rejected", "Hired / Offer", "In process", "No-show / Dropped"]):
+    r2 = st.columns(5)
+    for col, key in zip(r2, ["Rejected", "Hired / Offer", "Cleared all rounds", "In process", "No-show / Dropped"]):
         col.metric(key, f"{h[key]:,}")
     if res["duplicates_merged"]:
         st.caption(f"{res['duplicates_merged']} duplicate rows merged (same mobile / email).")
