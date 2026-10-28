@@ -2,7 +2,7 @@
 
 analyse_tab() turns one company-sheet tab into ONE row per unique candidate (the row with the most
 round information is kept, as in the round-funnel mode), attaches product category, bucket A-D and TR
-info with the same core functions the TA / SA stats use, and classifies every round with
+info with the same core functions the TA / SP stats use, and classifies every round with
 rounds.classify (Cleared / Rejected / Pending / No-show / Dropped / Other).
 """
 from __future__ import annotations
@@ -99,7 +99,7 @@ def analyse_tab(df, std, round_cols, STD, product_lookup, academy_kw, intensive_
     hired = cand["_person"].map(hired_person).fillna(False).astype(bool)
 
     cand["In TA"] = _in(cand["Mobile"], applied_mobiles).values
-    cand["In SA"] = _in(cand["Mobile"], shortlisted_mobiles).values
+    cand["In SP"] = _in(cand["Mobile"], shortlisted_mobiles).values
     cand["Furthest cleared"] = rounds.furthest_cleared(stages, round_cols).values
     cand["Latest outcome"] = rounds.current_outcome(stages, round_cols).values
     cand["Outcome"] = [_outcome([row[c] for c in round_cols], bool(h))
@@ -121,7 +121,7 @@ def headline(res) -> dict:
     out = cand["Outcome"]
     return {
         "Candidates": int(len(cand)),
-        "Shortlisted (in SA)": int(cand["In SA"].sum()),
+        "Shortlisted (in SP)": int(cand["In SP"].sum()),
         "Applied (in TA)": int(cand["In TA"].sum()),
         "Interviewed": int(_interviewed(stages).sum()),
         "Rejected": int(out.eq(REJECTED).sum()),
@@ -136,7 +136,7 @@ def round_funnel(res, only_shortlisted: bool = False) -> pd.DataFrame:
     """Per round: Reached, Cleared, Rejected, Pending, No-show, Dropped, Other + clear rates."""
     stages = res["stages"]
     if only_shortlisted:
-        stages = stages[res["cand"]["In SA"].values]
+        stages = stages[res["cand"]["In SP"].values]
     return rounds.funnel_table(stages, res["round_cols"], len(stages))
 
 
@@ -169,7 +169,7 @@ def _group_metrics(cand, stages, round_cols, mask) -> dict:
     m = {
         "Candidates": n,
         "In TA (applied)": int(c["In TA"].sum()),
-        "In SA (shortlisted)": int(c["In SA"].sum()),
+        "In SP (shortlisted)": int(c["In SP"].sum()),
         "Bucket students": int(c["In Bucket"].sum()),
         "Assessment cleared": int(c["In Assessment Pool"].sum()),
         "TR cleared": int(c["TR Cleared"].sum()),

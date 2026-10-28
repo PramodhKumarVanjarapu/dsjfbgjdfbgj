@@ -4,7 +4,7 @@ Run with: streamlit run analytics_app.py
 
 Input 1 - the job workbook (ONE Google Sheet link). Tabs are read like this:
   * TA tab   - the tab named "TA": total applications (unique candidates are counted)
-  * SA tab   - the tab named "SA": shortlisted profiles
+  * SP tab   - the tab named "SP": shortlisted profiles
   * Product  - EVERY tab that has a Product column plus a mobile / user id / email column
                is used to map candidates to their product
 Input 2 (optional) - the company sheet with interview details and rounds. Round columns are
@@ -165,8 +165,8 @@ def _name_keys(text: str) -> set:
     return {core.norm_col(x) for x in text.split(",") if core.norm_col(x)}
 
 
-def load_workbook(client, url: str, ta_names: str = "TA", sa_names: str = "SA", require_resume: bool = True) -> dict:
-    """Read every tab of the job workbook: TA = applications, SA = shortlisted, any tab with a Product column = product mapping."""
+def load_workbook(client, url: str, ta_names: str = "TA", sa_names: str = "SP", require_resume: bool = True) -> dict:
+    """Read every tab of the job workbook: TA = applications, SP = shortlisted, any tab with a Product column = product mapping."""
     if not url or "docs.google.com/spreadsheets" not in url:
         raise ValueError("Enter a valid Google Sheets URL.")
     book = client.open_by_url(url.strip())
@@ -206,18 +206,18 @@ def load_workbook(client, url: str, ta_names: str = "TA", sa_names: str = "SA", 
                 apps.append(ta)
                 ta_tabs.append(f"{ws.title} ({len(ta):,} of {len(df):,} rows)")
 
-        # ---- SA: shortlisted profiles ----
+        # ---- SP: shortlisted profiles ----
         elif is_sa:
             sa = std[_identity_mask(std)]
             if sa.empty:
-                skipped.append(f"{ws.title} (SA tab, but no mobile / email / user id found; "
+                skipped.append(f"{ws.title} (SP tab, but no mobile / email / user id found; "
                                f"columns seen: {list(df.columns)[:15]})")
             else:
                 shorts.append(sa)
                 sa_tabs.append(f"{ws.title} ({len(sa):,} rows)")
 
         elif not (std is not None and det.get("product")):
-            skipped.append(f"{ws.title} (not TA / SA and no Product column)")
+            skipped.append(f"{ws.title} (not TA / SP and no Product column)")
 
     if not apps:
         raise ValueError(f"No tab named '{ta_names}' with usable application rows was found. "
@@ -374,7 +374,7 @@ def _render_interviews(result, pools, tr_sum, academy_kw, intensive_kw, extra_pa
 
     h = interviews.headline(res)
     r1 = st.columns(4)
-    for col, key in zip(r1, ["Candidates", "Shortlisted (in SA)", "Applied (in TA)", "Interviewed"]):
+    for col, key in zip(r1, ["Candidates", "Shortlisted (in SP)", "Applied (in TA)", "Interviewed"]):
         col.metric(key, f"{h[key]:,}")
     r2 = st.columns(5)
     for col, key in zip(r2, ["Rejected", "Hired / Offer", "Cleared all rounds", "In process", "No-show / Dropped"]):
@@ -399,12 +399,12 @@ def _render_interviews(result, pools, tr_sum, academy_kw, intensive_kw, extra_pa
             st.altair_chart(bars + bars.mark_text(align="left", dx=4).encode(text="Cleared:Q"),
                             use_container_width=True)
         st.caption("Reached = has any status in the round. Cleared % of total is out of all candidates in the sheet.")
-        if h["Shortlisted (in SA)"]:
-            st.markdown("**Only shortlisted candidates (in SA)**")
+        if h["Shortlisted (in SP)"]:
+            st.markdown("**Only shortlisted candidates (in SP)**")
             st.dataframe(interviews.round_funnel(res, only_shortlisted=True), hide_index=True,
                          use_container_width=True)
         else:
-            st.caption("None of the company-sheet candidates matched the SA (shortlisted) tab by mobile.")
+            st.caption("None of the company-sheet candidates matched the SP (shortlisted) tab by mobile.")
 
     with p_tab:
         st.markdown("**By product: who is in the company sheet, outcomes, then each round cleared**")
@@ -426,18 +426,18 @@ def _render_interviews(result, pools, tr_sum, academy_kw, intensive_kw, extra_pa
     with c_tab:
         view = pd.DataFrame({
             "Name": cand["Name"], "Mobile": cand["Mobile"], "Category": cand["Category"],
-            "Bucket": cand["Bucket"], "TR Cleared": cand["TR Cleared"], "In TA": cand["In TA"], "In SA": cand["In SA"],
+            "Bucket": cand["Bucket"], "TR Cleared": cand["TR Cleared"], "In TA": cand["In TA"], "In SP": cand["In SP"],
             **{interviews.label(c): res["raw"][c] for c in round_cols},
             "Furthest cleared": cand["Furthest cleared"], "Latest outcome": cand["Latest outcome"],
             "Outcome": cand["Outcome"],
         })
         f1, f2, f3 = st.columns(3)
         sel_cat = f1.multiselect("Category", interviews.CAT_ORDER, default=interviews.CAT_ORDER, key="iv_cat")
-        only_sa = f2.checkbox("Shortlisted (SA) only", key="iv_sa")
+        only_sa = f2.checkbox("Shortlisted (SP) only", key="iv_sa")
         search = f3.text_input("Search name / mobile", key="iv_search")
         v = view[view["Category"].isin(sel_cat)]
         if only_sa:
-            v = v[v["In SA"]]
+            v = v[v["In SP"]]
         if search:
             s = search.strip().lower()
             v = v[v["Name"].fillna("").str.lower().str.contains(s, regex=False)
@@ -475,7 +475,7 @@ def _render_interviews(result, pools, tr_sum, academy_kw, intensive_kw, extra_pa
 # UI
 # --------------------------------------------------------------------------- #
 st.title("📊 Applicant Analytics — Single Job")
-st.caption("Paste the job workbook link (tabs TA and SA are read automatically; products come from every tab that has "
+st.caption("Paste the job workbook link (tabs TA and SP are read automatically; products come from every tab that has "
            "a Product column). Optionally add the company sheet for interview and round stats.")
 
 with st.sidebar:
@@ -488,7 +488,7 @@ with st.sidebar:
     st.header("Tab names")
     ta_text = st.text_input("Total applications tab", "TA", help="Exact tab name (case and spaces ignored). "
                                                                  "Comma-separate to allow several names.")
-    sa_text = st.text_input("Shortlisted profiles tab", "SA")
+    sa_text = st.text_input("Shortlisted profiles tab", "SP")
     require_resume = st.checkbox("Count only applications with a resume link", value=True,
                                  help="Applies when the TA tab has a resume column.")
     st.header("Interview rounds")
@@ -521,7 +521,7 @@ tr_sum = core.tr_summary(pools, tr_rule, [x.strip().lower() for x in cleared_val
 
 with st.form("job_inputs"):
     st.subheader("Input sheets")
-    sheet_url = st.text_input("Job workbook link (tabs TA, SA and product details)",
+    sheet_url = st.text_input("Job workbook link (tabs TA, SP and product details)",
                               placeholder="Paste the Google Sheet URL")
     company_url = st.text_input("Company sheet link — interview details & rounds (optional)",
                                 placeholder="Paste the company's tracking sheet URL")
@@ -599,7 +599,7 @@ if result:
     st.markdown("### Overall summary (unique candidates)")
     st.dataframe(pd.DataFrame([
         core.candidate_stats(app_u, "Total applications (TA)"),
-        core.candidate_stats(short_u, "Shortlisted profiles (SA)"),
+        core.candidate_stats(short_u, "Shortlisted profiles (SP)"),
     ]), use_container_width=True, hide_index=True)
 
     t1, t2, t3, t4, t5 = st.tabs(["Product-wise", "Bucket-wise (A–D)", "Candidate details", "Data checks",
@@ -642,7 +642,7 @@ if result:
     with t4:
         st.markdown("**Tab used as total applications (TA)**")
         st.write(result["ta_tabs"] or "None")
-        st.markdown("**Tab used as shortlisted (SA)**")
+        st.markdown("**Tab used as shortlisted (SP)**")
         st.write(result["sa_tabs"] or "None")
         st.markdown("**Tabs used for product mapping** (any tab with a Product column)")
         st.write(result["product_tabs"] or "None")
