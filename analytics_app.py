@@ -27,12 +27,14 @@ from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
+import altair as alt
 import gspread
 import pandas as pd
 import streamlit as st
 
 import core
 import interviews
+import pool_view
 import rounds
 from google_auth import get_google_credentials
 
@@ -380,15 +382,23 @@ def _render_interviews(result, pools, tr_sum, academy_kw, intensive_kw, extra_pa
     if res["duplicates_merged"]:
         st.caption(f"{res['duplicates_merged']} duplicate rows merged (same mobile / email).")
 
-    f_tab, p_tab, b_tab, c_tab, s_tab, q_tab = st.tabs(
-        ["Round funnel", "By product", "By bucket (A–D)", "Candidates", "Status mapping", "Data checks"])
+    f_tab, p_tab, b_tab, pool_tab, c_tab, s_tab, q_tab = st.tabs(
+        ["Round funnel", "By product", "By bucket (A–D)", "Pool coverage", "Candidates", "Status mapping",
+         "Data checks"])
 
     with f_tab:
         funnel = interviews.round_funnel(res)
         st.markdown("**All candidates in the company sheet**")
         st.dataframe(funnel, hide_index=True, use_container_width=True)
         if len(funnel):
-            st.bar_chart(funnel.set_index("Round")["Cleared"])
+            chart_df = pd.concat([pd.DataFrame({"Round": ["Candidates"], "Cleared": [h["Candidates"]]}),
+                                  funnel[["Round", "Cleared"]]])
+            bars = alt.Chart(chart_df).mark_bar().encode(
+                y=alt.Y("Round:N", sort=None, title=None), x=alt.X("Cleared:Q", title="Candidates cleared"),
+                tooltip=["Round", "Cleared"]).properties(height=40 * len(chart_df) + 20)
+            st.altair_chart(bars + bars.mark_text(align="left", dx=4).encode(text="Cleared:Q"),
+                            use_container_width=True)
+        st.caption("Reached = has any status in the round. Cleared % of total is out of all candidates in the sheet.")
         if h["Shortlisted (in SA)"]:
             st.markdown("**Only shortlisted candidates (in SA)**")
             st.dataframe(interviews.round_funnel(res, only_shortlisted=True), hide_index=True,
@@ -407,12 +417,19 @@ def _render_interviews(result, pools, tr_sum, academy_kw, intensive_kw, extra_pa
         st.dataframe(interviews.breakdown(cand, stages, round_cols, interviews.bucket_groups(cand)),
                      use_container_width=True)
 
+    with pool_tab:
+        pool_view.render_pool_metrics(pools, tr_sum, cand)
+        st.caption("How much of the placement pool is in this company sheet, and from which product.")
+        st.dataframe(pool_view.pool_coverage(pools, tr_sum, tr_rule, cand), hide_index=True,
+                     use_container_width=True)
+
     with c_tab:
         view = pd.DataFrame({
             "Name": cand["Name"], "Mobile": cand["Mobile"], "Category": cand["Category"],
             "Bucket": cand["Bucket"], "TR Cleared": cand["TR Cleared"], "In TA": cand["In TA"], "In SA": cand["In SA"],
             **{interviews.label(c): res["raw"][c] for c in round_cols},
-            "Furthest cleared": cand["Furthest cleared"], "Outcome": cand["Outcome"],
+            "Furthest cleared": cand["Furthest cleared"], "Latest outcome": cand["Latest outcome"],
+            "Outcome": cand["Outcome"],
         })
         f1, f2, f3 = st.columns(3)
         sel_cat = f1.multiselect("Category", interviews.CAT_ORDER, default=interviews.CAT_ORDER, key="iv_cat")
