@@ -1,0 +1,8 @@
+# secrets - never commit
+token.json
+oauth_client.json
+oauth_pending.json
+service_account.json
+.streamlit/secrets.toml
+__pycache__/
+*.pyc
