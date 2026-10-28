@@ -485,7 +485,8 @@ def _identity_keys(row, cols: dict) -> list[str]:
     return keys
 
 
-def build_product_lookup(product_df: pd.DataFrame, academy_kw, intensive_kw, source: str = "Product tab") -> dict:
+def build_product_lookup(product_df: pd.DataFrame, academy_kw, intensive_kw, source: str = "Product tab",
+                         source_col: str | None = None) -> dict:
     """identity key (mobile / user id / email) -> (product, category).
 
     A person listed several times keeps the strongest product (Intensive > Academy > External).
@@ -501,10 +502,11 @@ def build_product_lookup(product_df: pd.DataFrame, academy_kw, intensive_kw, sou
         if _is_junk(product):
             continue
         cat = categorize_product(product, academy_kw, intensive_kw)
+        src = f"Tab: {row.get(source_col)}" if source_col else source   # which tab the product came from
         for k in _identity_keys(row, cols):
             cur = lookup.get(k)
             if cur is None or _CAT_RANK[cat] < _CAT_RANK[cur[1]]:
-                lookup[k] = (str(product).strip(), cat, source)
+                lookup[k] = (str(product).strip(), cat, src)
     return lookup
 
 

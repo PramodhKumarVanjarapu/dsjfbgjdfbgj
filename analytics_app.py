@@ -1,17 +1,21 @@
-"""Single-job applicant analytics app (one Google Sheet in, all stats out).
+"""Applicant analytics app (one Google Sheet in, all stats out).
 
 Run with: streamlit run analytics_app.py
 
-Input: ONE Google Sheet link. The workbook is read tab by tab:
-  * Application tabs  - every tab that has BOTH a mobile/phone column and a resume-link column
-                        (tabs whose name starts with "shortlist" or contains "product" are never counted here)
-  * Shortlist tabs    - every tab whose name starts with "shortlist" (Shortlist, Shortlisted Profiles, ...)
-  * Product tab       - the tab whose name contains "product"; maps each candidate to a product
+Input 1 - the job workbook (ONE Google Sheet link). Tabs are read like this:
+  * TA tab   - the tab named "TA": total applications (unique candidates are counted)
+  * SA tab   - the tab named "SA": shortlisted profiles
+  * Product  - EVERY tab that has a Product column plus a mobile / user id / email column
+               is used to map candidates to their product
+Input 2 (optional) - the company sheet with interview details and rounds. Round columns are
+detected automatically and the stats are split by product and by bucket A, B, C, D.
+
 All stats are computed on UNIQUE candidates (one row per person).
 
-The master summary sheet link is configured once in .streamlit/secrets.toml:
-    [analytics]
-    master_summary_sheet_url = "https://docs.google.com/spreadsheets/d/..."
+Configuration (environment variables on Render, or .streamlit/secrets.toml locally):
+    MASTER_SUMMARY_SHEET_URL   master summary sheet link
+    APP_PASSWORD               shared password for the app
+    GOOGLE_TOKEN_JSON          contents of token.json (see google_auth.py)
 """
 from __future__ import annotations
 
@@ -28,6 +32,8 @@ import pandas as pd
 import streamlit as st
 
 import core
+import interviews
+import rounds
 from google_auth import get_google_credentials
 
 st.set_page_config(page_title="Applicant Analytics", page_icon="📊", layout="wide")
@@ -104,9 +110,15 @@ def _worksheet_to_df(ws) -> pd.DataFrame:
             hdr = i
             break
     headers = [str(x).strip() or f"Unnamed: {i + 1}" for i, x in enumerate(values[hdr])]
-    width = len(headers)
+    # Duplicate headers (e.g. two "Internship Company Name" columns) are made unique.
+    seen: dict = {}
+    unique = []
+    for h in headers:
+        seen[h] = seen.get(h, 0) + 1
+        unique.append(h if seen[h] == 1 else f"{h} ({seen[h]})")
+    width = len(unique)
     rows = [(r + [""] * width)[:width] for r in values[hdr + 1:]]
-    df = pd.DataFrame(rows, columns=headers)
+    df = pd.DataFrame(rows, columns=unique)
     blank = df.apply(lambda row: all(not str(v).strip() for v in row), axis=1)
     return df.loc[~blank].reset_index(drop=True)
 
@@ -116,28 +128,17 @@ def _find_job_col(df: pd.DataFrame):
 
 
 # --------------------------------------------------------------------------- #
-# Tab classification + loading
+# Tab loading
 # --------------------------------------------------------------------------- #
-def _is_shortlist_tab(title: str, keywords=("shortlist",)) -> bool:
-    # "Shortlisted", "Shortlist - Round 1", "Final Shortlisted Profiles", "1. Shortlisted" ...
-    # `keywords` comes from the sidebar so tabs like "New Profiles" can be added.
-    n = core.norm_col(title)
-    return any(core.norm_col(k) and core.norm_col(k) in n for k in keywords) and not n.startswith("not")
-
-
-def _is_product_tab(title: str) -> bool:
-    return "product" in core.norm_col(title)
-
-
 def _standardise(df: pd.DataFrame, tab: str) -> pd.DataFrame:
     """Rename whatever columns a tab uses to the standard schema."""
     det = core.detect_columns(df)
     out = pd.DataFrame(index=df.index)
     for key, std in STD.items():
         out[std] = df[det[key]] if det.get(key) else ""
-    # Some exports (e.g. the shortlisted "New Profiles" tab) label the candidate's 10-digit
-    # mobile number as "UUID"/"UID". If there is no mobile column and that column is
-    # (almost) all phone numbers, treat it as the mobile number.
+    # Some exports (e.g. the shortlisted tab) label the candidate's 10-digit mobile number
+    # as "UUID"/"UID". If there is no mobile column and that column is (almost) all phone
+    # numbers, treat it as the mobile number.
     if not det.get("mobile") and det.get("uid") and len(df):
         uid_vals = df[det["uid"]]
         if uid_vals.map(lambda v: core.norm_mobile(v) is not None).mean() >= 0.8:
@@ -153,74 +154,108 @@ def _has_value(series: pd.Series) -> pd.Series:
     return ~series.map(core._is_junk)
 
 
-def load_workbook(client, url: str, shortlist_kw=("shortlist",)) -> dict:
-    """Read every tab of the single input sheet and sort the tabs into their roles."""
+def _identity_mask(std: pd.DataFrame) -> pd.Series:
+    return (std["Mobile"].map(core.norm_mobile).notna() | std["Email"].map(core.norm_email).notna()
+            | std["User ID"].map(core.norm_text).notna())
+
+
+def _name_keys(text: str) -> set:
+    return {core.norm_col(x) for x in text.split(",") if core.norm_col(x)}
+
+
+def load_workbook(client, url: str, ta_names: str = "TA", sa_names: str = "SA", require_resume: bool = True) -> dict:
+    """Read every tab of the job workbook: TA = applications, SA = shortlisted, any tab with a Product column = product mapping."""
     if not url or "docs.google.com/spreadsheets" not in url:
         raise ValueError("Enter a valid Google Sheets URL.")
     book = client.open_by_url(url.strip())
+    ta_keys, sa_keys = _name_keys(ta_names), _name_keys(sa_names)
 
     apps, shorts, products = [], [], []
-    fallback_product = None
-    app_tabs, short_tabs, product_tabs, skipped = [], [], [], []
+    ta_tabs, sa_tabs, product_tabs, skipped, all_titles = [], [], [], [], []
 
     for ws in book.worksheets():
+        all_titles.append(ws.title)
         df = _worksheet_to_df(ws)
         if df.empty:
             skipped.append(f"{ws.title} (empty)")
             continue
         det = core.detect_columns(df)
+        key = core.norm_col(ws.title)
+        is_ta, is_sa = key in ta_keys, key in sa_keys
+        std = _standardise(df, ws.title) if (is_ta or is_sa or det.get("product")) else None
 
-        if _is_shortlist_tab(ws.title, shortlist_kw):
-            std = _standardise(df, ws.title)
-            identity = std["Mobile"].map(core.norm_mobile).notna() | std["Email"].map(core.norm_email).notna() \
-                | std["User ID"].map(core.norm_text).notna()
-            std = std[identity]
-            if std.empty:
-                skipped.append(f"{ws.title} (shortlist tab, but no mobile / email / user id found; "
-                               f"columns seen: {list(df.columns)[:15]})")
-                continue
-            # Shortlist products are NOT taken from the shortlist tab itself; they are
-            # mapped from the total product data (product tab / total applications).
-            std["Product"] = ""
-            shorts.append(std)
-            short_tabs.append(f"{ws.title} ({len(std):,} rows)")
+        # ---- product mapping: EVERY tab with a Product column + an identity column ----
+        if std is not None and det.get("product"):
+            pf = std[_has_value(std["Product"]) & _identity_mask(std)]
+            if len(pf):
+                products.append(pf)
+                product_tabs.append(f"{ws.title} ({len(pf):,} rows with a product)")
 
-        elif _is_product_tab(ws.title):
-            products.append(df)
-            product_tabs.append(f"{ws.title} ({len(df):,} rows)")
-
-        elif det.get("mobile") and det.get("resume"):
-            std = _standardise(df, ws.title)
-            valid = std["Mobile"].map(core.norm_mobile).notna() & _has_value(std["Resume"])
-            std = std[valid]
-            if std.empty:
-                skipped.append(f"{ws.title} (no rows with both mobile and resume link)")
-                continue
-            apps.append(std)
-            app_tabs.append(f"{ws.title} ({len(std):,} rows)")
-
-        elif det.get("product") and (det.get("mobile") or det.get("uid") or det.get("email")):
-            # A product list whose tab is not literally named "product".
-            if fallback_product is None:
-                fallback_product = (ws.title, df)
+        # ---- TA: total applications ----
+        if is_ta:
+            valid = std["Mobile"].map(core.norm_mobile).notna()
+            if require_resume and det.get("resume"):
+                valid &= _has_value(std["Resume"])
+            ta = std[valid]
+            if ta.empty:
+                skipped.append(f"{ws.title} (TA tab, but no rows with a valid mobile" +
+                               (" and resume link" if require_resume and det.get("resume") else "") + ")")
             else:
-                skipped.append(f"{ws.title} (not an application, shortlist or product tab)")
-        else:
-            skipped.append(f"{ws.title} (no mobile + resume columns)")
+                apps.append(ta)
+                ta_tabs.append(f"{ws.title} ({len(ta):,} of {len(df):,} rows)")
 
-    if not products and fallback_product is not None:
-        products.append(fallback_product[1])
-        product_tabs.append(f"{fallback_product[0]} (detected by its columns)")
+        # ---- SA: shortlisted profiles ----
+        elif is_sa:
+            sa = std[_identity_mask(std)]
+            if sa.empty:
+                skipped.append(f"{ws.title} (SA tab, but no mobile / email / user id found; "
+                               f"columns seen: {list(df.columns)[:15]})")
+            else:
+                shorts.append(sa)
+                sa_tabs.append(f"{ws.title} ({len(sa):,} rows)")
+
+        elif not (std is not None and det.get("product")):
+            skipped.append(f"{ws.title} (not TA / SA and no Product column)")
 
     if not apps:
-        raise ValueError("No tab has both a mobile/phone column and a resume-link column with data.")
+        raise ValueError(f"No tab named '{ta_names}' with usable application rows was found. "
+                         f"Tabs in this workbook: {all_titles}")
 
     return {
         "apps": pd.concat(apps, ignore_index=True),
         "shorts": pd.concat(shorts, ignore_index=True) if shorts else pd.DataFrame(),
         "products": pd.concat(products, ignore_index=True, sort=False) if products else pd.DataFrame(),
-        "app_tabs": app_tabs, "short_tabs": short_tabs, "product_tabs": product_tabs, "skipped": skipped,
+        "ta_tabs": ta_tabs, "sa_tabs": sa_tabs, "product_tabs": product_tabs, "skipped": skipped,
     }
+
+
+def load_company_sheet(client, url: str, only_linked_tab: bool = False) -> dict:
+    """Company sheet with interview details: every tab that has a candidate identity AND round columns."""
+    if not url or "docs.google.com/spreadsheets" not in url:
+        raise ValueError("Enter a valid Google Sheets URL for the company sheet.")
+    book = client.open_by_url(url.strip())
+    gid = re.search(r"[?#&]gid=(\d+)", url)
+    tabs, skipped = [], []
+    for ws in book.worksheets():
+        if only_linked_tab and gid and ws.id != int(gid.group(1)):
+            continue
+        df = _worksheet_to_df(ws)
+        if df.empty:
+            skipped.append(f"{ws.title} (empty)")
+            continue
+        std = _standardise(df, ws.title)
+        if not _identity_mask(std).any():
+            skipped.append(f"{ws.title} (no mobile / email / user id column)")
+            continue
+        round_cols = rounds.detect_round_columns(df)
+        if not round_cols:
+            skipped.append(f"{ws.title} (no round / status columns)")
+            continue
+        tabs.append({"title": ws.title, "df": df, "std": std, "rounds": round_cols})
+    if not tabs:
+        raise ValueError("No tab in the company sheet has both candidate contact columns and round columns. "
+                         + (f"Skipped: {skipped}" if skipped else ""))
+    return {"tabs": tabs, "skipped": skipped}
 
 
 # --------------------------------------------------------------------------- #
@@ -248,16 +283,21 @@ def _process(std_df: pd.DataFrame, product_lookup, academy_kw, intensive_kw, poo
     """Standardised rows -> (row-level matched frame, unique-candidate frame)."""
     if std_df.empty:
         return pd.DataFrame(), pd.DataFrame()
-    cols = {k: STD[k] for k in STD}
-    prepared = core.prepare_company(std_df, cols, None, {}, None, None, academy_kw, intensive_kw)
+    prepared = core.prepare_company(std_df, dict(STD), None, {}, None, None, academy_kw, intensive_kw)
     prepared = core.apply_products(prepared, product_lookup, academy_kw, intensive_kw)
     matched = core.match_company(prepared, pools, tr_sum)
     return matched, core.unique_candidates(matched)
 
 
+def _mobile_set(df: pd.DataFrame) -> frozenset:
+    if df is None or df.empty or "Mobile" not in df:
+        return frozenset()
+    return frozenset(v for v in df["Mobile"] if isinstance(v, str))
+
+
 def _append_summary(client, master_url: str, row: dict):
     if not master_url:
-        raise RuntimeError("Missing analytics.master_summary_sheet_url in Streamlit secrets.")
+        raise RuntimeError("Missing MASTER_SUMMARY_SHEET_URL.")
     ws = _worksheet_for_url(client, master_url)
     existing = ws.get_all_values()
     headers = list(row.keys())
@@ -292,25 +332,151 @@ def _summary_row(result: dict, tr_rule: str) -> dict:
         for bucket in BUCKETS:
             row[f"{prefix} Academy Bucket {bucket}"] = int(bt.at[bucket, "Candidates"])
             row[f"{prefix} Academy Bucket {bucket} TR cleared"] = int(bt.at[bucket, "TR cleared"])
+    if result.get("company_url"):
+        row["Company sheet URL"] = result["company_url"]
+    for title, res in result.get("company_results", {}).items():
+        row.update(interviews.master_columns(title, res))
     return row
+
+
+# --------------------------------------------------------------------------- #
+# Interviews & rounds tab
+# --------------------------------------------------------------------------- #
+def _render_interviews(result, pools, tr_sum, academy_kw, intensive_kw, extra_pass, extra_fail):
+    tabs = result.get("company_tabs")
+    if not tabs:
+        st.info("Paste the company sheet link (interview details and rounds) in the form above and run again "
+                "to see round-wise stats here.")
+        return
+    if result.get("company_skipped"):
+        st.caption("Company sheet tabs skipped: " + "; ".join(result["company_skipped"]))
+
+    names = [t["title"] for t in tabs]
+    pick = st.selectbox("Company sheet tab", names, key="iv_tab")
+    tb = tabs[names.index(pick)]
+    round_cols = st.multiselect(
+        "Rounds in funnel order (auto-detected — add, remove or re-order)", list(tb["df"].columns),
+        default=tb["rounds"], format_func=interviews.label, key=f"iv_rounds_{pick}")
+    if not round_cols:
+        st.warning("No round columns selected. Pick them in the box above.")
+        return
+
+    res = interviews.analyse_tab(
+        tb["df"], tb["std"], round_cols, dict(STD), result["product_lookup"], academy_kw, intensive_kw,
+        pools, tr_sum, extra_pass, extra_fail,
+        applied_mobiles=_mobile_set(result["apps_unique"]), shortlisted_mobiles=_mobile_set(result["short_unique"]))
+    if res is None:
+        st.error("No candidate in this tab has a usable mobile / email / user id.")
+        return
+    cand, stages = res["cand"], res["stages"]
+
+    h = interviews.headline(res)
+    r1 = st.columns(4)
+    for col, key in zip(r1, ["Candidates", "Shortlisted (in SA)", "Applied (in TA)", "Interviewed"]):
+        col.metric(key, f"{h[key]:,}")
+    r2 = st.columns(4)
+    for col, key in zip(r2, ["Rejected", "Hired / Offer", "In process", "No-show / Dropped"]):
+        col.metric(key, f"{h[key]:,}")
+    if res["duplicates_merged"]:
+        st.caption(f"{res['duplicates_merged']} duplicate rows merged (same mobile / email).")
+
+    f_tab, p_tab, b_tab, c_tab, s_tab, q_tab = st.tabs(
+        ["Round funnel", "By product", "By bucket (A–D)", "Candidates", "Status mapping", "Data checks"])
+
+    with f_tab:
+        funnel = interviews.round_funnel(res)
+        st.markdown("**All candidates in the company sheet**")
+        st.dataframe(funnel, hide_index=True, use_container_width=True)
+        if len(funnel):
+            st.bar_chart(funnel.set_index("Round")["Cleared"])
+        if h["Shortlisted (in SA)"]:
+            st.markdown("**Only shortlisted candidates (in SA)**")
+            st.dataframe(interviews.round_funnel(res, only_shortlisted=True), hide_index=True,
+                         use_container_width=True)
+        else:
+            st.caption("None of the company-sheet candidates matched the SA (shortlisted) tab by mobile.")
+
+    with p_tab:
+        st.markdown("**By product: who is in the company sheet, outcomes, then each round cleared**")
+        st.dataframe(interviews.breakdown(cand, stages, round_cols, interviews.product_groups(cand)),
+                     use_container_width=True)
+
+    with b_tab:
+        st.caption("Buckets A–D apply to Academy candidates only; the last two columns hold Academy candidates "
+                   "outside A–D.")
+        st.dataframe(interviews.breakdown(cand, stages, round_cols, interviews.bucket_groups(cand)),
+                     use_container_width=True)
+
+    with c_tab:
+        view = pd.DataFrame({
+            "Name": cand["Name"], "Mobile": cand["Mobile"], "Category": cand["Category"],
+            "Bucket": cand["Bucket"], "TR Cleared": cand["TR Cleared"], "In TA": cand["In TA"], "In SA": cand["In SA"],
+            **{interviews.label(c): res["raw"][c] for c in round_cols},
+            "Furthest cleared": cand["Furthest cleared"], "Outcome": cand["Outcome"],
+        })
+        f1, f2, f3 = st.columns(3)
+        sel_cat = f1.multiselect("Category", interviews.CAT_ORDER, default=interviews.CAT_ORDER, key="iv_cat")
+        only_sa = f2.checkbox("Shortlisted (SA) only", key="iv_sa")
+        search = f3.text_input("Search name / mobile", key="iv_search")
+        v = view[view["Category"].isin(sel_cat)]
+        if only_sa:
+            v = v[v["In SA"]]
+        if search:
+            s = search.strip().lower()
+            v = v[v["Name"].fillna("").str.lower().str.contains(s, regex=False)
+                  | v["Mobile"].fillna("").str.contains(s, regex=False)]
+        st.caption(f"{len(v):,} candidates")
+        st.dataframe(v, hide_index=True, use_container_width=True)
+        st.download_button("⬇️ Download these candidates (CSV)", v.to_csv(index=False).encode("utf-8"),
+                           file_name="company_sheet_candidates.csv", mime="text/csv", key="iv_dl")
+
+    with s_tab:
+        st.caption("Every value found in the round columns and how it was counted. Fix wrong ones with the "
+                   "extra status words in the sidebar.")
+        sm = interviews.status_mapping(tb["df"], round_cols, extra_pass, extra_fail)
+        st.dataframe(sm, hide_index=True, use_container_width=True)
+        other = sm[sm["Counted as"] == "Other"]
+        if len(other):
+            st.warning(f"{len(other)} value(s) weren't recognised and are counted as 'Other'.")
+
+    with q_tab:
+        ooo = rounds.out_of_order(stages, round_cols)
+        st.table(pd.DataFrame({
+            "Check": ["Rows without a usable mobile / email / user id", "Duplicate rows merged",
+                      "Candidates in the company sheet but not in TA (never applied)",
+                      "Candidates with a later-round status while an earlier round isn't Cleared"],
+            "Count": [res["rows_without_id"], res["duplicates_merged"], int((~cand["In TA"]).sum()), int(ooo.sum())],
+        }))
+        st.markdown("**Where the product came from**")
+        st.dataframe(cand["Product Source"].value_counts().rename_axis("Source").reset_index(name="Candidates"),
+                     hide_index=True, use_container_width=True)
+        st.caption("Columns not used as rounds: " +
+                   ", ".join(interviews.label(c) for c in tb["df"].columns if c not in round_cols))
 
 
 # --------------------------------------------------------------------------- #
 # UI
 # --------------------------------------------------------------------------- #
 st.title("📊 Applicant Analytics — Single Job")
-st.caption("Paste one Google Sheet link. Applications, shortlist and product tabs are detected automatically. "
-           "The master summary sheet is configured once in secrets.")
+st.caption("Paste the job workbook link (tabs TA and SA are read automatically; products come from every tab that has "
+           "a Product column). Optionally add the company sheet for interview and round stats.")
 
 with st.sidebar:
     st.header("Analytics rules")
     academy_text = st.text_input("Academy product keyword(s)", "ACADEMY")
     intensive_text = st.text_input("Intensive product keyword(s)", "INTENSIVE")
-    shortlist_text = st.text_input("Shortlist tab name keyword(s)", "shortlist, new profiles",
-                                   help="Any tab whose name contains one of these is read as shortlisted profiles.")
     tr_rule = st.selectbox("TR Cleared rule", core.TR_RULES, index=0)
     cleared_values = st.multiselect("Statuses counted as cleared",
                                     ["cleared", "clear", "passed", "selected"], default=["cleared"])
+    st.header("Tab names")
+    ta_text = st.text_input("Total applications tab", "TA", help="Exact tab name (case and spaces ignored). "
+                                                                 "Comma-separate to allow several names.")
+    sa_text = st.text_input("Shortlisted profiles tab", "SA")
+    require_resume = st.checkbox("Count only applications with a resume link", value=True,
+                                 help="Applies when the TA tab has a resume column.")
+    st.header("Interview rounds")
+    extra_pass = [w.strip().lower() for w in st.text_input("Extra words counted as Cleared", "").split(",") if w.strip()]
+    extra_fail = [w.strip().lower() for w in st.text_input("Extra words counted as Rejected", "").split(",") if w.strip()]
 
 _require_password()
 
@@ -337,20 +503,22 @@ intensive_kw = [x.strip().upper() for x in intensive_text.split(",") if x.strip(
 tr_sum = core.tr_summary(pools, tr_rule, [x.strip().lower() for x in cleared_values])
 
 with st.form("job_inputs"):
-    st.subheader("Input sheet")
-    sheet_url = st.text_input("Google Sheet link (all tabs in one workbook)",
-                              placeholder="Paste the sheet URL containing applications, shortlist and product tabs")
+    st.subheader("Input sheets")
+    sheet_url = st.text_input("Job workbook link (tabs TA, SA and product details)",
+                              placeholder="Paste the Google Sheet URL")
+    company_url = st.text_input("Company sheet link — interview details & rounds (optional)",
+                                placeholder="Paste the company's tracking sheet URL")
+    only_linked = st.checkbox("Company sheet: read only the tab in the link (gid)", value=False)
     job_id = st.text_input("Job ID (optional)", placeholder="Leave blank to read it from the sheet")
-    run_analysis = st.form_submit_button("Fetch sheet and calculate stats", type="primary")
+    run_analysis = st.form_submit_button("Fetch sheets and calculate stats", type="primary")
 
 if run_analysis:
     if not sheet_url.strip():
-        st.error("Please paste the Google Sheet link.")
+        st.error("Please paste the job workbook link.")
         st.stop()
     try:
         with st.spinner("Reading all tabs…"):
-            shortlist_kw = [x.strip() for x in shortlist_text.split(",") if x.strip()] or ["shortlist"]
-            wb = load_workbook(client, sheet_url, shortlist_kw)
+            wb = load_workbook(client, sheet_url, ta_text, sa_text, require_resume)
 
         job_ids = list(dict.fromkeys(str(x).strip() for x in wb["apps"]["Job ID"] if str(x).strip()))
         resolved_job = job_id.strip()
@@ -362,32 +530,42 @@ if run_analysis:
                            "Enter the intended Job ID above and run again.")
                 st.stop()
 
+        # Product for every candidate comes from ALL tabs that have a Product column.
         product_lookup = {}
         if not wb["products"].empty:
-            product_lookup = core.build_product_lookup(wb["products"], academy_kw, intensive_kw)
-        # Total applications' own product column fills anyone the product tab doesn't cover.
-        if (~wb["apps"]["Product"].map(core._is_junk)).any():
-            apps_lookup = core.build_product_lookup(wb["apps"], academy_kw, intensive_kw,
-                                                    source="Total applications tab")
-            for key, val in apps_lookup.items():
-                product_lookup.setdefault(key, val)
+            product_lookup = core.build_product_lookup(wb["products"], academy_kw, intensive_kw,
+                                                       source_col="_Source Tab")
 
         apps_matched, apps_unique = _process(wb["apps"], product_lookup, academy_kw, intensive_kw, pools, tr_sum)
         short_matched, short_unique = _process(wb["shorts"], product_lookup, academy_kw, intensive_kw, pools, tr_sum)
 
+        company_tabs, company_skipped, company_results = None, [], {}
+        if company_url.strip():
+            with st.spinner("Reading the company sheet…"):
+                cs = load_company_sheet(client, company_url, only_linked)
+            company_tabs, company_skipped = cs["tabs"], cs["skipped"]
+            for t in company_tabs:  # default rounds, used for the master summary row
+                r = interviews.analyse_tab(
+                    t["df"], t["std"], t["rounds"], dict(STD), product_lookup, academy_kw, intensive_kw,
+                    pools, tr_sum, extra_pass, extra_fail,
+                    applied_mobiles=_mobile_set(apps_unique), shortlisted_mobiles=_mobile_set(short_unique))
+                if r is not None:
+                    company_results[t["title"]] = r
+
         st.session_state["analytics_result"] = {
-            "job_id": resolved_job, "sheet_url": sheet_url.strip(),
-            "app_tabs": wb["app_tabs"], "short_tabs": wb["short_tabs"],
-            "product_tabs": wb["product_tabs"], "skipped": wb["skipped"],
+            "job_id": resolved_job, "sheet_url": sheet_url.strip(), "company_url": company_url.strip(),
+            "ta_tabs": wb["ta_tabs"], "sa_tabs": wb["sa_tabs"], "product_tabs": wb["product_tabs"],
+            "skipped": wb["skipped"], "product_lookup": product_lookup,
             "apps_matched": apps_matched, "short_matched": short_matched,
             "apps_unique": apps_unique, "short_unique": short_unique,
+            "company_tabs": company_tabs, "company_skipped": company_skipped, "company_results": company_results,
         }
     except Exception as exc:
         st.error(f"Couldn't process the sheet: {type(exc).__name__}: {exc}")
         with st.expander("Detailed error information", expanded=True):
             st.code(traceback.format_exc(), language="text")
-        st.info("Check that the sheet URL is correct, the signed-in Google account has access, "
-                "and the expected columns/tabs are present.")
+        st.info("Check that the sheet URLs are correct, the signed-in Google account has access, "
+                "and the expected tabs/columns are present.")
         st.stop()
 
 result = st.session_state.get("analytics_result")
@@ -396,19 +574,19 @@ if result:
     st.divider()
     st.subheader(f"Results · Job ID: {result['job_id'] or 'Not provided'}")
 
-    if not result["short_tabs"]:
-        st.warning("No tab whose name starts with 'Shortlist' was found, so shortlist numbers are zero.")
+    if not result["sa_tabs"]:
+        st.warning(f"No usable tab named '{sa_text}' was found, so shortlist numbers are zero.")
     if not result["product_tabs"]:
-        st.warning("No product tab found. Products were only taken from the application tabs' own product "
-                   "column; everything without one is counted as External.")
+        st.warning("No tab with a Product column was found. Everyone is counted as External.")
 
     st.markdown("### Overall summary (unique candidates)")
     st.dataframe(pd.DataFrame([
-        core.candidate_stats(app_u, "Total applications"),
-        core.candidate_stats(short_u, "Shortlisted profiles"),
+        core.candidate_stats(app_u, "Total applications (TA)"),
+        core.candidate_stats(short_u, "Shortlisted profiles (SA)"),
     ]), use_container_width=True, hide_index=True)
 
-    t1, t2, t3, t4 = st.tabs(["Product-wise", "Bucket-wise (A–D)", "Candidate details", "Data checks"])
+    t1, t2, t3, t4, t5 = st.tabs(["Product-wise", "Bucket-wise (A–D)", "Candidate details", "Data checks",
+                                  "Interviews & rounds"])
 
     with t1:
         c1, c2 = st.columns(2)
@@ -445,11 +623,11 @@ if result:
         st.dataframe(short_u, use_container_width=True, hide_index=True)
 
     with t4:
-        st.markdown("**Tabs used as applications** (mobile + resume link present)")
-        st.write(result["app_tabs"] or "None")
-        st.markdown("**Tabs used as shortlist**")
-        st.write(result["short_tabs"] or "None")
-        st.markdown("**Tabs used as product mapping**")
+        st.markdown("**Tab used as total applications (TA)**")
+        st.write(result["ta_tabs"] or "None")
+        st.markdown("**Tab used as shortlisted (SA)**")
+        st.write(result["sa_tabs"] or "None")
+        st.markdown("**Tabs used for product mapping** (any tab with a Product column)")
         st.write(result["product_tabs"] or "None")
         if result["skipped"]:
             st.markdown("**Tabs skipped**")
@@ -466,6 +644,13 @@ if result:
                 st.dataframe(m["Bucket Match By"].fillna("Not in bucket pool").value_counts()
                              .rename_axis("Matched by").reset_index(name="Rows"),
                              use_container_width=True, hide_index=True)
+
+    with t5:
+        try:
+            _render_interviews(result, pools, tr_sum, academy_kw, intensive_kw, extra_pass, extra_fail)
+        except Exception as exc:
+            st.error(f"Couldn't build the interview stats: {type(exc).__name__}: {exc}")
+            st.code(traceback.format_exc(), language="text")
 
     if st.button("Append this summary to master Google Sheet", type="primary", key="append_summary"):
         try:
